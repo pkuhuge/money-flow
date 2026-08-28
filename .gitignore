@@ -1,0 +1,18 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Generated market data and local runtime output.
+akshare_data/
+model_data/
+*.sqlite
+*.db
+logs/
+
+# Local/private files that do not belong in this public repo.
+iam_key.md
+admin_admin0508.csv
+
+# Unrelated experiments present in the working directory.
+bigr-monitor-deployer/
+cyberpunk-game/
