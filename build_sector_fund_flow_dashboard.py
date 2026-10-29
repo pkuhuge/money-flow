@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+from math import isfinite
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import escape
@@ -15,6 +16,8 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+
+from sector_catalog import load_sector_catalog
 
 
 PROJECT_DIR = Path(os.environ.get("MONEY_FLOW_PROJECT_DIR", Path(__file__).resolve().parent))
@@ -43,9 +46,7 @@ def find_snapshots(data_root: Path) -> list[Snapshot]:
         stamp = parse_stamp(run_dir)
         if stamp is None:
             continue
-        if not (run_dir / "industry_fund_flow_now.csv").exists():
-            continue
-        if not (run_dir / "concept_fund_flow_now.csv").exists():
+        if not any((run_dir / f"{kind}_fund_flow_now.csv").exists() for kind in ("industry", "concept")):
             continue
         snapshots.append(
             Snapshot(
@@ -64,6 +65,7 @@ def read_snapshot_table(snapshot: Snapshot, filename: str, kind: str) -> list[di
         return []
     df = pd.read_csv(path)
     if "行业" in df.columns:
+        df = df.dropna(subset=["行业"])
         df["行业"] = df["行业"].astype(str).str.strip()
         df = df[df["行业"] != ""].drop_duplicates(subset=["行业"], keep="last")
     rows: list[dict] = []
@@ -76,6 +78,10 @@ def read_snapshot_table(snapshot: Snapshot, filename: str, kind: str) -> list[di
         except (TypeError, ValueError):
             return None
 
+    def float_or_none(value: object) -> float | None:
+        number = pd.to_numeric(value, errors="coerce")
+        return float(number) if pd.notna(number) and isfinite(number) else None
+
     for _, row in df.iterrows():
         name = str(row.get("行业", "")).strip()
         if not name:
@@ -87,15 +93,17 @@ def read_snapshot_table(snapshot: Snapshot, filename: str, kind: str) -> list[di
                 "time": snapshot.time,
                 "stamp": snapshot.stamp.isoformat(timespec="seconds"),
                 "name": name,
-                "net": float(row.get("净额", 0) or 0),
-                "change": float(row.get("行业-涨跌幅", 0) or 0),
-                "leader": str(row.get("领涨股", "") or ""),
-                "leaderChange": float(row.get("领涨股-涨跌幅", 0) or 0),
-                "companies": int(row.get("公司家数", 0) or 0),
+                "net": float_or_none(row.get("净额")),
+                "change": float_or_none(row.get("行业-涨跌幅")),
+                "leader": str(row["领涨股"]) if pd.notna(row.get("领涨股")) else "",
+                "leaderChange": float_or_none(row.get("领涨股-涨跌幅")),
+                "companies": int_or_none(row.get("公司家数")),
                 "upCount": int_or_none(row.get("上涨家数")),
                 "downCount": int_or_none(row.get("下跌家数")),
             }
         )
+        if pd.notna(row.get("数据时间")):
+            rows[-1]["dataStamp"] = str(row["数据时间"])
     return rows
 
 
@@ -183,7 +191,7 @@ def read_stock_big_deal_table(snapshot: Snapshot) -> list[dict]:
     return rows
 
 
-def build_payload(snapshots: list[Snapshot]) -> dict:
+def build_payload(snapshots: list[Snapshot], data_root: Path = DATA_ROOT) -> dict:
     rows: list[dict] = []
     for snapshot in snapshots:
         rows.extend(read_snapshot_table(snapshot, "industry_fund_flow_now.csv", "industry"))
@@ -199,11 +207,19 @@ def build_payload(snapshots: list[Snapshot]) -> dict:
 
     dates = sorted({snapshot.date for snapshot in snapshots})
     latest_run = str(snapshots[-1].run_dir) if snapshots else ""
+    catalog = load_sector_catalog(data_root)
+    sector_names = {
+        kind: sorted(set(catalog.get(kind, {}).get("names", [])) | {r["name"] for r in rows if r["kind"] == kind})
+        for kind in ("industry", "concept")
+    }
     return {
         "generatedAt": datetime.now().isoformat(timespec="seconds"),
         "availableDates": dates,
         "latestDate": dates[-1] if dates else "",
         "rows": rows,
+        "sectorNames": sector_names,
+        "snapshotStamps": {snapshot.date: snapshot.stamp.isoformat(timespec="seconds") for snapshot in snapshots},
+        "snapshotTimes": {date: sorted({s.time for s in snapshots if s.date == date}) for date in dates},
         "stocks": stocks,
         "latestRun": latest_run,
         "nasdaqFutures": fetch_nasdaq_futures_7d(),
@@ -299,7 +315,7 @@ def fetch_nasdaq_futures_7d() -> dict:
 
 
 def render_html(payload: dict) -> str:
-    data_json = json.dumps(payload, ensure_ascii=False)
+    data_json = json.dumps(payload, ensure_ascii=False, allow_nan=False)
     title_date = payload.get("latestDate") or datetime.now().strftime("%Y-%m-%d")
     latest_run = escape(payload.get("latestRun", ""))
     return f"""<!doctype html>
@@ -539,7 +555,15 @@ def render_html(payload: dict) -> str:
     const palette = ['#b72d39', '#c2410c', '#be123c', '#9f1239', '#dc2626', '#ea580c', '#0f766e', '#0f766e', '#0d9488', '#115e59', '#134e4a', '#166534'];
 
     function fmt(value) {{
-      return `${{Number(value || 0).toFixed(2)}}`;
+      return value === null || value === undefined || !Number.isFinite(Number(value)) ? 'null' : Number(value).toFixed(2);
+    }}
+
+    function hasNet(row) {{
+      return typeof row?.net === 'number' && Number.isFinite(row.net);
+    }}
+
+    function netOrder(a, b) {{
+      return hasNet(a) && hasNet(b) ? b.net - a.net : Number(hasNet(b)) - Number(hasNet(a)) || a.name.localeCompare(b.name, 'zh-CN');
     }}
 
     function fmtMoney(value) {{
@@ -572,13 +596,18 @@ def render_html(payload: dict) -> str:
 
     function latestRowsForDate(kind, date) {{
       const rows = payload.rows.filter(r => r.kind === kind && r.date === date);
-      if (!rows.length) return [];
+      if (!rows.length && !(payload.availableDates || []).includes(date)) return [];
       const byName = new Map();
       rows.forEach(row => {{
         const current = byName.get(row.name);
-        if (!current || row.stamp > current.stamp) byName.set(row.name, row);
+        if (!current || (hasNet(row) && !hasNet(current)) || (hasNet(row) === hasNet(current) && row.stamp > current.stamp)) byName.set(row.name, row);
       }});
-      return [...byName.values()];
+      const latestStamp = rows.reduce((latest, r) => r.stamp > latest ? r.stamp : latest, payload.snapshotStamps?.[date] || '');
+      const names = payload.sectorNames?.[kind] || [...byName.keys()];
+      return names.map(name => {{
+        const row = byName.get(name);
+        return row ? {{ ...row, stale: hasNet(row) && row.stamp < latestStamp }} : {{ kind, date, name, net: null, change: null, leader: '', leaderChange: null, companies: null, upCount: null, downCount: null, stamp: latestStamp, dataStamp: null }};
+      }});
     }}
 
     function latestStocksForDate(date) {{
@@ -595,15 +624,19 @@ def render_html(payload: dict) -> str:
       const dates = (payload.availableDates || []).filter(d => d >= start && d <= end);
       dates.forEach(date => {{
         latestRowsForDate(kind, date).forEach(row => {{
-          const current = byName.get(row.name) || {{ ...row, net: 0, days: 0 }};
-          current.net += row.net;
-          current.days += 1;
-          current.change = row.change;
-          current.leader = row.leader;
-          current.leaderChange = row.leaderChange;
-          current.companies = row.companies;
-          current.upCount = row.upCount;
-          current.downCount = row.downCount;
+          const current = byName.get(row.name) || {{ ...row, net: null, days: 0 }};
+          if (hasNet(row)) {{
+            current.net = (current.net ?? 0) + row.net;
+            current.days += 1;
+            current.change = row.change;
+            current.leader = row.leader;
+            current.leaderChange = row.leaderChange;
+            current.companies = row.companies;
+            current.upCount = row.upCount;
+            current.downCount = row.downCount;
+            current.dataStamp = row.dataStamp;
+          }}
+          current.partial = current.days < dates.length;
           byName.set(row.name, current);
         }});
       }});
@@ -611,17 +644,18 @@ def render_html(payload: dict) -> str:
     }}
 
     function halfHourNet(row) {{
-      if (!row?.stamp) return row?.net ?? 0;
+      if (!hasNet(row)) return null;
+      if (!row.stamp) return row.net;
       const current = new Date(row.stamp);
       if (Number.isNaN(current.getTime())) return row.net;
       const marketOpen = new Date(`${{row.date}}T09:30:00`);
       const target = new Date(current.getTime() - 30 * 60 * 1000);
       if (target <= marketOpen) return row.net;
       const candidates = payload.rows
-        .filter(r => r.kind === row.kind && r.date === row.date && r.name === row.name && new Date(r.stamp) <= target)
+        .filter(r => r.kind === row.kind && r.date === row.date && r.name === row.name && hasNet(r) && new Date(r.stamp) <= target)
         .sort((a, b) => new Date(a.stamp) - new Date(b.stamp));
       const baseline = candidates.at(-1);
-      return baseline ? row.net - baseline.net : row.net;
+      return baseline ? row.net - baseline.net : null;
     }}
 
     function filteredRows(rows) {{
@@ -633,19 +667,23 @@ def render_html(payload: dict) -> str:
       const {{ start, end, isSingle }} = dateRange();
       if (isSingle) {{
         const rows = payload.rows.filter(r => r.kind === kind && r.date === start && r.name === name);
-        const byTime = new Map(rows.map(r => [r.time, r]));
-        const ticks = [...new Set(payload.rows.filter(r => r.kind === kind && r.date === start).map(r => r.time))].sort();
+        const byTime = new Map();
+        rows.forEach(row => {{
+          const current = byTime.get(row.time);
+          if (!current || row.stamp > current.stamp) byTime.set(row.time, row);
+        }});
+        const ticks = payload.snapshotTimes?.[start] || [...new Set(payload.rows.filter(r => r.kind === kind && r.date === start).map(r => r.time))].sort();
         return {{ ticks, points: ticks.map(t => byTime.get(t) || {{ time: t, label: t, net: null }}) }};
       }}
       const dates = (payload.availableDates || []).filter(d => d >= start && d <= end);
       let cumulative = 0;
       const points = dates.map(date => {{
         const rows = latestRowsForDate(kind, date).filter(r => r.name === name);
-        if (rows[0]) {{
+        if (hasNet(rows[0])) {{
           cumulative += rows[0].net;
           return {{ ...rows[0], label: date.slice(5), dailyNet: rows[0].net, net: cumulative }};
         }}
-        return {{ date, label: date.slice(5), dailyNet: null, net: cumulative }};
+        return {{ date, label: date.slice(5), dailyNet: null, net: null }};
       }});
       return {{ ticks: dates.map(d => d.slice(5)), points }};
     }}
@@ -654,22 +692,23 @@ def render_html(payload: dict) -> str:
       const {{ start, end, isSingle }} = dateRange();
       if (isSingle) {{
         const dayRows = payload.rows.filter(r => r.kind === kind && r.date === start);
-        const ticks = [...new Set(dayRows.map(r => r.time))].sort();
-        const carried = new Map();
+        const ticks = payload.snapshotTimes?.[start] || [...new Set(dayRows.map(r => r.time))].sort();
         const points = ticks.map(t => {{
-          dayRows.filter(r => r.time === t).forEach(row => carried.set(row.name, row.net));
-          const net = [...carried.values()].reduce((sum, value) => sum + value, 0);
-          return {{ label: t, net, count: carried.size }};
+          const byName = new Map();
+          dayRows.filter(r => r.time === t).forEach(row => byName.set(row.name, row));
+          const rows = [...byName.values()].filter(hasNet);
+          const net = rows.length ? rows.reduce((sum, row) => sum + row.net, 0) : null;
+          return {{ label: t, net, count: rows.length }};
         }});
         return {{ ticks, points, modeText: '盘中快照合计' }};
       }}
       const dates = (payload.availableDates || []).filter(d => d >= start && d <= end);
       let cumulative = 0;
       const points = dates.map(date => {{
-        const rows = latestRowsForDate(kind, date);
-        const dailyNet = rows.reduce((sum, row) => sum + row.net, 0);
-        cumulative += dailyNet;
-        return {{ label: date.slice(5), date, net: cumulative, dailyNet, count: rows.length }};
+        const rows = latestRowsForDate(kind, date).filter(hasNet);
+        const dailyNet = rows.length ? rows.reduce((sum, row) => sum + row.net, 0) : null;
+        if (dailyNet !== null) cumulative += dailyNet;
+        return {{ label: date.slice(5), date, net: dailyNet === null ? null : cumulative, dailyNet, count: rows.length }};
       }});
       return {{ ticks: dates.map(d => d.slice(5)), points, modeText: '按天累计合计' }};
     }}
@@ -677,12 +716,12 @@ def render_html(payload: dict) -> str:
     function selectedNames(kind) {{
       const {{ isSingle }} = dateRange();
       if (isSingle) {{
-        const rows = filteredRows(lastSnapshotRows(kind));
+        const rows = filteredRows(lastSnapshotRows(kind)).filter(hasNet);
         const positive = rows.filter(r => r.net >= 0).sort((a, b) => b.net - a.net).slice(0, 8);
         const negative = rows.filter(r => r.net < 0).sort((a, b) => a.net - b.net).slice(0, 8);
         return [...positive, ...negative].map(r => r.name);
       }}
-      const rows = filteredRows(lastSnapshotRows(kind)).sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
+      const rows = filteredRows(lastSnapshotRows(kind)).filter(hasNet).sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
       const positive = rows.filter(r => r.net >= 0).sort((a, b) => b.net - a.net).slice(0, 6);
       const negative = rows.filter(r => r.net < 0).sort((a, b) => a.net - b.net).slice(0, 6);
       return [...positive, ...negative].map(r => r.name);
@@ -754,9 +793,14 @@ def render_html(payload: dict) -> str:
       packed.forEach((series, idx) => {{
         const last = series.points.slice().reverse().find(p => p.net !== null);
         const color = last?.net >= 0 ? palette[idx % 6] : palette[6 + (idx % 6)];
-        const coords = series.points.map((p, i) => p.net === null ? null : [x(i), y(p.net)]).filter(Boolean);
-        if (!coords.length) return;
-        const path = coords.map((p, i) => `${{i ? 'L' : 'M'}} ${{p[0].toFixed(1)}} ${{p[1].toFixed(1)}}`).join(' ');
+        let connected = false;
+        const path = series.points.map((p, i) => {{
+          if (!hasNet(p)) {{ connected = false; return ''; }}
+          const command = connected ? 'L' : 'M';
+          connected = true;
+          return `${{command}} ${{x(i).toFixed(1)}} ${{y(p.net).toFixed(1)}}`;
+        }}).filter(Boolean).join(' ');
+        if (!path) return;
         svg.insertAdjacentHTML('beforeend', `<path class="line series-line" d="${{path}}" stroke="${{color}}" data-name="${{escAttr(series.name)}}"></path>`);
         svg.insertAdjacentHTML('beforeend', `<path class="series-hitline" d="${{path}}" data-name="${{escAttr(series.name)}}"></path>`);
         series.points.forEach((point, pointIndex) => {{
@@ -823,15 +867,19 @@ def render_html(payload: dict) -> str:
     }}
 
     function drawTable() {{
-      const rows = filteredRows(lastSnapshotRows(mode)).sort((a, b) => b.net - a.net);
+      const rows = filteredRows(lastSnapshotRows(mode)).sort(netOrder);
       const {{ start, end, isSingle }} = dateRange();
-      document.getElementById('tableNote').textContent = `${{rows.length}} 个板块 · ${{isSingle ? '各板块最近可用记录' : `${{start}} 至 ${{end}} 净额求和`}}`;
-      const countText = v => v === null || v === undefined ? '' : v;
-      const header = '<tr><th>序号</th><th>板块</th><th>净额(亿)</th><th title="过去半小时净额">半小时净额</th><th>涨跌幅</th><th>上涨</th><th>下跌</th><th>公司数</th><th>领涨股</th><th>领涨股涨幅</th></tr>';
+      const available = rows.filter(hasNet).length;
+      document.getElementById('tableNote').textContent = `${{rows.length}} 个板块 · 有数据 ${{available}} · 缺失 ${{rows.length - available}} · ${{isSingle ? '当天最近可用记录' : `${{start}} 至 ${{end}} 净额求和`}}`;
+      const countText = v => v === null || v === undefined ? 'null' : v;
+      const pctText = v => v === null || v === undefined ? 'null' : `${{fmt(v)}}%`;
+      const flowClass = v => v === null ? '' : v >= 0 ? 'pos' : 'neg';
+      const header = '<tr><th>序号</th><th>板块</th><th>净额(亿)</th><th title="过去半小时净额">半小时净额</th><th>涨跌幅</th><th>上涨</th><th>下跌</th><th>公司数</th><th>领涨股</th><th>领涨股涨幅</th><th>数据时间 / 状态</th></tr>';
       const body = rows.map((r, i) => {{
         const half = isSingle ? halfHourNet(r) : null;
-        const halfText = half === null ? '<td></td>' : `<td class="${{half >= 0 ? 'pos' : 'neg'}}">${{fmt(half)}}</td>`;
-        return `<tr><td>${{i + 1}}</td><td title="${{r.name}}">${{r.name}}</td><td class="${{r.net >= 0 ? 'pos' : 'neg'}}">${{fmt(r.net)}}</td>${{halfText}}<td>${{fmt(r.change)}}%</td><td class="pos">${{countText(r.upCount)}}</td><td class="neg">${{countText(r.downCount)}}</td><td>${{r.companies || ''}}</td><td title="${{r.leader}}">${{r.leader || ''}}</td><td>${{r.leaderChange ? fmt(r.leaderChange) + '%' : ''}}</td></tr>`;
+        const halfText = `<td class="${{flowClass(half)}}">${{isSingle ? fmt(half) : ''}}</td>`;
+        const status = !hasNet(r) ? '缺失' : isSingle ? `${{(r.dataStamp || r.stamp).slice(11, 16)}}${{r.stale ? '（较早）' : ''}}` : `${{r.days}}/${{(payload.availableDates || []).filter(d => d >= start && d <= end).length}} 天`;
+        return `<tr><td>${{i + 1}}</td><td title="${{escAttr(r.name)}}">${{escHtml(r.name)}}</td><td class="${{flowClass(r.net)}}">${{fmt(r.net)}}</td>${{halfText}}<td>${{pctText(r.change)}}</td><td class="pos">${{countText(r.upCount)}}</td><td class="neg">${{countText(r.downCount)}}</td><td>${{countText(r.companies)}}</td><td title="${{escAttr(r.leader)}}">${{escHtml(r.leader || 'null')}}</td><td>${{pctText(r.leaderChange)}}</td><td>${{status}}</td></tr>`;
       }}).join('');
       document.getElementById('fullTable').innerHTML = header + body;
     }}
@@ -851,15 +899,18 @@ def render_html(payload: dict) -> str:
       svg.innerHTML = '';
       tooltip.style.display = 'none';
       note.textContent = `${{kindName}} · ${{data.modeText}} · ${{isSingle ? start : `${{start}} 至 ${{end}}`}}`;
-      source.textContent = '全板块合计，不受搜索框影响';
-      if (!points.length) {{
+      const validPoints = points.filter(hasNet);
+      const sectorCount = payload.sectorNames?.[mode]?.length || 0;
+      const latestCount = points.at(-1)?.count || 0;
+      source.textContent = `全板块合计 · 最近有数据 ${{latestCount}}/${{sectorCount}} · 缺失不计入`;
+      if (!validPoints.length) {{
         latest.textContent = '';
         change.textContent = '';
         svg.insertAdjacentHTML('beforeend', '<text class="axis-label" x="50%" y="50%" text-anchor="middle">暂无总资金数据</text>');
         return;
       }}
-      const last = points[points.length - 1];
-      const first = points[0];
+      const last = validPoints.at(-1);
+      const first = validPoints[0];
       const delta = last.net - first.net;
       latest.textContent = `${{fmt(last.net)}}亿`;
       latest.className = `mini-price ${{last.net >= 0 ? 'pos' : 'neg'}}`;
@@ -869,7 +920,7 @@ def render_html(payload: dict) -> str:
       const width = 1120, height = 280;
       const margin = {{ left: 58, right: 24, top: 18, bottom: 36 }};
       svg.setAttribute('viewBox', `0 0 ${{width}} ${{height}}`);
-      const values = points.map(p => p.net);
+      const values = validPoints.map(p => p.net);
       let min = Math.min(0, ...values), max = Math.max(0, ...values);
       const pad = Math.max(5, (max - min) * 0.16);
       min -= pad; max += pad;
@@ -891,9 +942,16 @@ def render_html(payload: dict) -> str:
         }}
       }});
       const color = last.net >= 0 ? '#b72d39' : '#0f766e';
-      const path = points.map((point, i) => `${{i ? 'L' : 'M'}} ${{x(i).toFixed(1)}} ${{y(point.net).toFixed(1)}}`).join(' ');
+      let connected = false;
+      const path = points.map((point, i) => {{
+        if (!hasNet(point)) {{ connected = false; return ''; }}
+        const command = connected ? 'L' : 'M';
+        connected = true;
+        return `${{command}} ${{x(i).toFixed(1)}} ${{y(point.net).toFixed(1)}}`;
+      }}).filter(Boolean).join(' ');
       svg.insertAdjacentHTML('beforeend', `<path class="line" d="${{path}}" stroke="${{color}}"></path>`);
       points.forEach((point, i) => {{
+        if (!hasNet(point)) return;
         const daily = point.dailyNet === undefined ? '' : point.dailyNet;
         svg.insertAdjacentHTML('beforeend', `<circle class="hover-point total-flow-point" cx="${{x(i).toFixed(1)}}" cy="${{y(point.net).toFixed(1)}}" r="8" fill="${{color}}" data-label="${{escAttr(point.label)}}" data-net="${{escAttr(point.net)}}" data-daily="${{escAttr(daily)}}" data-count="${{escAttr(point.count)}}" data-single="${{isSingle ? '1' : '0'}}"></circle>`);
       }});
@@ -998,7 +1056,7 @@ def render_html(payload: dict) -> str:
     function recentStats(row, lookback = 3) {{
       const {{ end }} = dateRange();
       const dates = (payload.availableDates || []).filter(d => d <= end).slice(-lookback);
-      const rows = dates.map(date => latestRowsForDate(row.kind, date).find(r => r.name === row.name)).filter(Boolean);
+      const rows = dates.map(date => latestRowsForDate(row.kind, date).find(r => r.name === row.name)).filter(hasNet);
       const total = rows.reduce((sum, r) => sum + r.net, 0);
       const positiveDays = rows.filter(r => r.net > 0).length;
       const negativeDays = rows.filter(r => r.net < 0).length;
@@ -1060,7 +1118,7 @@ def render_html(payload: dict) -> str:
     function drawAnalysis() {{
       const {{ start, end, isSingle }} = dateRange();
       const kindName = mode === 'industry' ? '行业' : '概念';
-      const rows = filteredRows(lastSnapshotRows(mode));
+      const rows = filteredRows(lastSnapshotRows(mode)).filter(r => hasNet(r) && typeof r.change === 'number');
       const signal = nasdaqSignal();
       const enriched = rows.map(row => {{
         const stats = recentStats(row);
@@ -1165,7 +1223,7 @@ def main() -> int:
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
-    payload = build_payload(find_snapshots(data_root))
+    payload = build_payload(find_snapshots(data_root), data_root)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(render_html(payload), encoding="utf-8")

@@ -126,8 +126,17 @@ def extract_output_dir(stdout: str) -> Path | None:
 
 def csv_row_count(path: Path) -> int:
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            return max(0, sum(1 for _ in handle) - 1)
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            names = set()
+            for row in csv.DictReader(handle):
+                name = (row.get("行业") or "").strip()
+                try:
+                    net = float(row.get("净额", ""))
+                except (TypeError, ValueError):
+                    continue
+                if name and net == net and abs(net) != float("inf"):
+                    names.add(name)
+            return len(names)
     except FileNotFoundError:
         return 0
 
@@ -152,9 +161,20 @@ def snapshot_complete(out_dir: Path | None) -> tuple[bool, str]:
     return True, "ok"
 
 
+def log_missing_sectors(out_dir: Path) -> None:
+    path = out_dir / "pull_summary.csv"
+    if not path.exists():
+        return
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            if row.get("label") in REQUIRED_TABLES and row.get("error"):
+                reason = f"{row['label']}: {row['error']}"
+                log(reason)
+                append_status(event="sector_coverage", status="incomplete", output_dir=str(out_dir), reason=reason)
+
+
 def run_pull_once(retries: int, timeout_seconds: int) -> tuple[subprocess.CompletedProcess[str] | None, Path | None, str]:
     cmd = [str(PYTHON), str(PULL_SCRIPT), "--retries", str(retries)]
-    log(f"run: {' '.join(cmd)}")
     try:
         completed = subprocess.run(
             cmd,
@@ -172,11 +192,12 @@ def run_pull_once(retries: int, timeout_seconds: int) -> tuple[subprocess.Comple
         if stderr:
             log("stderr before timeout:\n" + str(stderr).rstrip())
         return None, extract_output_dir(str(stdout)), f"timeout after {timeout_seconds}s"
-    if completed.stdout:
-        log("stdout:\n" + completed.stdout.rstrip())
-    if completed.stderr:
-        log("stderr:\n" + completed.stderr.rstrip())
-    log(f"exit={completed.returncode}")
+    if completed.returncode != 0:
+        if completed.stdout:
+            log("stdout:\n" + completed.stdout.rstrip())
+        if completed.stderr:
+            log("stderr:\n" + completed.stderr.rstrip())
+        log(f"exit={completed.returncode}")
     return completed, extract_output_dir(completed.stdout), f"exit={completed.returncode}"
 
 
@@ -291,14 +312,15 @@ def main() -> int:
         if not args.skip_big_deal:
             run_big_deal_once(complete_dir, args.big_deal_timeout)
 
+        log_missing_sectors(complete_dir)
         dashboard_cmd = [str(PYTHON), str(DASHBOARD_SCRIPT)]
         dashboard = subprocess.run(dashboard_cmd, cwd=str(PROJECT_DIR), text=True, capture_output=True, check=False)
-        if dashboard.stdout:
-            log("dashboard stdout:\n" + dashboard.stdout.rstrip())
-        if dashboard.stderr:
-            log("dashboard stderr:\n" + dashboard.stderr.rstrip())
-        log(f"dashboard exit={dashboard.returncode}")
         if dashboard.returncode != 0:
+            if dashboard.stdout:
+                log("dashboard stdout:\n" + dashboard.stdout.rstrip())
+            if dashboard.stderr:
+                log("dashboard stderr:\n" + dashboard.stderr.rstrip())
+            log(f"dashboard exit={dashboard.returncode}")
             append_status(
                 event="dashboard",
                 status="failed",

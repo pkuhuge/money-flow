@@ -20,6 +20,8 @@ from typing import Callable
 
 import pandas as pd
 
+from sector_catalog import refresh_sector_catalog
+
 
 PROJECT_DIR = Path(os.environ.get("MONEY_FLOW_PROJECT_DIR", Path(__file__).resolve().parent))
 DEFAULT_OUTPUT_ROOT = Path(os.environ.get("MONEY_FLOW_DATA_ROOT", PROJECT_DIR / "akshare_data"))
@@ -325,38 +327,67 @@ def pull_fund_flow_rankings(ak, conn: sqlite3.Connection, out_dir: Path, retries
     return results
 
 
-def pull_industry_fund_flow_now(ak, conn: sqlite3.Connection, out_dir: Path, retries: int) -> FetchResult:
-    try:
-        flow_df = with_retries(
-            "industry_fund_flow_now",
-            lambda: ak.stock_fund_flow_industry(symbol="即时"),
-            retries,
-            2.0,
-        )
+def pull_sector_flow_now(ak, conn: sqlite3.Connection, out_dir: Path, retries: int, kind: str, catalog: dict) -> FetchResult:
+    label = f"{kind}_fund_flow_now"
+    expected = set(catalog.get(kind, {}).get("flowNames", []))
+    frames = []
+    missing = expected.copy()
+    errors = []
+    for attempt in range(1, max(1, retries) + 1):
         try:
-            summary_df = with_retries(
-                "stock_board_industry_summary_ths",
-                ak.stock_board_industry_summary_ths,
-                retries,
-                1.0,
-            )
-            if not summary_df.empty:
-                summary_df = summary_df.rename(columns={"板块": "行业"})
-                keep_cols = [col for col in ["行业", "上涨家数", "下跌家数"] if col in summary_df.columns]
-                flow_df = flow_df.merge(summary_df[keep_cols], on="行业", how="left")
+            df = getattr(ak, f"stock_fund_flow_{kind}")(symbol="即时").copy()
+            df = df.dropna(subset=["行业"])
+            df["行业"] = df["行业"].astype(str).str.strip()
+            df["净额"] = pd.to_numeric(df["净额"], errors="coerce")
+            df = df[(df["行业"] != "") & df["净额"].notna()]
+            df["数据时间"] = datetime.now().isoformat(timespec="seconds")
+            frames.append(df)
+            combined = pd.concat(frames, ignore_index=True).drop_duplicates("行业", keep="last")
+            missing = expected - set(combined["行业"])
+            if not missing and not combined.empty:
+                break
+            print(f"[{now_text()}] {label} coverage attempt {attempt}/{retries}: missing={len(missing)}")
         except Exception as exc:
-            print(f"[{now_text()}] industry up/down summary skipped: {type(exc).__name__}: {exc}")
-        count = write_table(conn, out_dir, "industry_fund_flow_now", flow_df)
-        return FetchResult("industry_fund_flow_now", ok=count > 0, rows=count)
+            errors.append(f"{type(exc).__name__}: {exc}")
+            print(f"[{now_text()}] {label} attempt {attempt}/{retries} failed: {errors[-1]}")
+    if not frames:
+        return FetchResult(label, ok=False, error="; ".join(errors))
+    flow_df = pd.concat(frames, ignore_index=True).drop_duplicates("行业", keep="last")
+    count = len(flow_df)
+    flow_df["数据状态"] = "ok"
+    absent = set(catalog.get(kind, {}).get("names", [])) - set(flow_df["行业"])
+    if absent:
+        placeholders = pd.DataFrame({"行业": sorted(absent), "数据状态": "missing"})
+        flow_df = pd.concat([flow_df, placeholders], ignore_index=True)
+    if kind == "industry":
+        flow_df = add_industry_counts(ak, flow_df, retries)
+    write_table(conn, out_dir, label, flow_df)
+    error = f"missing {len(missing)} sectors: {', '.join(sorted(missing))}" if missing else ""
+    return FetchResult(label, ok=count > 0, rows=count, error=error)
+
+
+def add_industry_counts(ak, flow_df: pd.DataFrame, retries: int) -> pd.DataFrame:
+    try:
+        summary_df = with_retries(
+            "stock_board_industry_summary_ths",
+            ak.stock_board_industry_summary_ths,
+            retries,
+            1.0,
+        )
+        if not summary_df.empty:
+            summary_df = summary_df.rename(columns={"板块": "行业"})
+            summary_df["行业"] = summary_df["行业"].astype(str).str.strip()
+            keep_cols = [col for col in ["行业", "上涨家数", "下跌家数"] if col in summary_df.columns]
+            flow_df = flow_df.merge(summary_df[keep_cols].drop_duplicates("行业", keep="last"), on="行业", how="left")
     except Exception as exc:
-        err_df = pd.DataFrame([{"label": "industry_fund_flow_now", "error": str(exc), "created_at": now_text()}])
-        write_table(conn, out_dir, "industry_fund_flow_now_errors", err_df)
-        return FetchResult("industry_fund_flow_now", ok=False, error=str(exc))
+        print(f"[{now_text()}] industry up/down summary skipped: {type(exc).__name__}: {exc}")
+    return flow_df
 
 
 def pull_sector_fund_flows(ak, conn: sqlite3.Connection, out_dir: Path, retries: int) -> list[FetchResult]:
     results: list[FetchResult] = []
-    results.append(pull_industry_fund_flow_now(ak, conn, out_dir, retries))
+    catalog = refresh_sector_catalog(ak, out_dir.parent)
+    results.append(pull_sector_flow_now(ak, conn, out_dir, retries, "industry", catalog))
     for symbol, window in [
         ("3日排行", "3d"),
         ("5日排行", "5d"),
@@ -370,8 +401,8 @@ def pull_sector_fund_flows(ak, conn: sqlite3.Connection, out_dir: Path, retries:
                 retries,
             )
         )
+    results.append(pull_sector_flow_now(ak, conn, out_dir, retries, "concept", catalog))
     for symbol, window in [
-        ("即时", "now"),
         ("3日排行", "3d"),
         ("5日排行", "5d"),
     ]:
